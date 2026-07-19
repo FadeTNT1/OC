@@ -1,34 +1,27 @@
--- Ender IO Alloy Smelter controller
--- Sends exactly 1 input item to each Alloy Smelter
--- Pulls completed items into a vanilla Minecraft barrel
+-- Fast Alloy Smelter controller for CC:Tweaked + Ender IO
+--
+-- Network layout:
+--   * One gold Sophisticated Storage barrel containing ores (source)
+--   * One basic oak Sophisticated Storage barrel receiving products (output)
+--   * Any number of Ender IO Alloy Smelters
+--   * Every block connected to the same CC:Tweaked wired-modem network
+--
+-- The larger Sophisticated Storage barrel is selected as the source.
+-- The smaller Sophisticated Storage barrel is selected as the output.
 
---------------------------------------------------
--- CONFIGURATION
---------------------------------------------------
+local Controller = {}
 
--- Input barrel receiving items from AE2
-local SOURCE_NAME = "sophisticatedstorage:barrel_0"
-
--- Normal vanilla Minecraft output barrel
--- Change the number if your modem displays a different name.
-local OUTPUT_NAME = "minecraft:barrel_0"
-
--- Alloy Smelter inventory slots
-local INPUT_SLOTS = { 1, 2, 3 }
+local INPUT_SLOT_1 = 1
+local INPUT_SLOT_2 = 2
+local INPUT_SLOT_3 = 3
 local OUTPUT_SLOT = 4
+local OUTPUT_LIMIT = 64
 
--- Delay between complete network scans
-local CHECK_INTERVAL = 0.05
+local function hasPeripheralType(api, name, wanted)
+    local types = { api.getType(name) }
 
---------------------------------------------------
--- PERIPHERAL HELPERS
---------------------------------------------------
-
-local function hasType(name, wantedType)
-    local types = { peripheral.getType(name) }
-
-    for _, peripheralType in ipairs(types) do
-        if peripheralType == wantedType then
+    for index = 1, #types do
+        if types[index] == wanted then
             return true
         end
     end
@@ -36,188 +29,246 @@ local function hasType(name, wantedType)
     return false
 end
 
-local function findAlloySmelters()
-    local smelters = {}
+function Controller.detectBarrels(api)
+    local barrels = {}
 
-    for _, name in ipairs(peripheral.getNames()) do
-        if name ~= SOURCE_NAME
-            and name ~= OUTPUT_NAME
-            and string.find(name, "alloy_smelter", 1, true)
-            and hasType(name, "inventory") then
+    for _, name in ipairs(api.getNames()) do
+        if string.find(name, "sophisticatedstorage:barrel", 1, true)
+            and hasPeripheralType(api, name, "inventory") then
 
-            table.insert(smelters, name)
+            local inventory = api.wrap(name)
+
+            if inventory and type(inventory.size) == "function" then
+                barrels[#barrels + 1] = {
+                    name = name,
+                    size = inventory.size(),
+                }
+            end
         end
     end
 
-    table.sort(smelters)
+    if #barrels < 2 then
+        error("Connect both Sophisticated Storage barrels to the wired network.")
+    end
+
+    table.sort(barrels, function(left, right)
+        if left.size == right.size then
+            return left.name < right.name
+        end
+
+        return left.size < right.size
+    end)
+
+    local output = barrels[1]
+    local source = barrels[#barrels]
+
+    if source.size == output.size then
+        error("Could not distinguish the gold source barrel from the oak output barrel.")
+    end
+
+    return source.name, output.name
+end
+
+function Controller.findSmelters(api, sourceName, outputName)
+    local smelters = {}
+
+    for _, name in ipairs(api.getNames()) do
+        if name ~= sourceName
+            and name ~= outputName
+            and string.find(name, "alloy_smelter", 1, true)
+            and hasPeripheralType(api, name, "inventory") then
+
+            local inventory = api.wrap(name)
+
+            if inventory
+                and type(inventory.list) == "function"
+                and type(inventory.pushItems) == "function" then
+
+                smelters[#smelters + 1] = {
+                    name = name,
+                    inventory = inventory,
+                }
+            end
+        end
+    end
+
+    table.sort(smelters, function(left, right)
+        return left.name < right.name
+    end)
+
     return smelters
 end
 
-local function getSortedSlots(inventory)
+function Controller.newSourceState(source)
     local slots = {}
 
-    for slot in pairs(inventory.list()) do
-        table.insert(slots, slot)
-    end
-
-    table.sort(slots)
-    return slots
-end
-
---------------------------------------------------
--- INPUT HANDLING
---------------------------------------------------
-
-local function countInputItems(machine)
-    local contents = machine.list()
-    local total = 0
-
-    for _, slot in ipairs(INPUT_SLOTS) do
-        local item = contents[slot]
-
-        if item then
-            total = total + item.count
+    for slot, item in pairs(source.list()) do
+        if item.count and item.count > 0 then
+            slots[#slots + 1] = {
+                slot = slot,
+                count = item.count,
+            }
         end
     end
 
-    return total
+    return {
+        slots = slots,
+        index = 1,
+    }
 end
 
-local function sendOneInput(source, machineName)
-    local sourceSlots = getSortedSlots(source)
+function Controller.pushOneInput(source, machineName, sourceState)
+    local slots = sourceState.slots
+    local slotCount = #slots
 
-    for _, sourceSlot in ipairs(sourceSlots) do
-        for _, targetSlot in ipairs(INPUT_SLOTS) do
-            local success, moved = pcall(function()
-                return source.pushItems(
-                    machineName,
-                    sourceSlot,
-                    1,
-                    targetSlot
-                )
-            end)
+    if slotCount == 0 then
+        return 0
+    end
 
-            if success and moved == 1 then
-                return true
+    local checked = 0
+
+    while checked < slotCount do
+        local entry = slots[sourceState.index]
+
+        if entry and entry.count > 0 then
+            local moved = source.pushItems(
+                machineName,
+                entry.slot,
+                1,
+                INPUT_SLOT_1
+            )
+
+            if moved > 0 then
+                entry.count = entry.count - moved
+
+                if entry.count <= 0 then
+                    sourceState.index = (sourceState.index % slotCount) + 1
+                end
+
+                return moved
             end
         end
+
+        sourceState.index = (sourceState.index % slotCount) + 1
+        checked = checked + 1
     end
 
-    return false
+    return 0
 end
 
---------------------------------------------------
--- OUTPUT HANDLING
---------------------------------------------------
+function Controller.serviceMachine(
+    source,
+    outputName,
+    machineName,
+    machine,
+    sourceState
+)
+    local items = machine.list()
+    local movedOut = 0
 
-local function collectOutput(outputBarrel, machineName, machine)
-    local contents = machine.list()
-    local outputItem = contents[OUTPUT_SLOT]
+    -- Empty the finished-product slot first.
+    local outputItem = items[OUTPUT_SLOT]
 
-    if not outputItem then
-        return 0
-    end
-
-    local success, moved = pcall(function()
-        return outputBarrel.pullItems(
-            machineName,
+    if outputItem then
+        movedOut = machine.pushItems(
+            outputName,
             OUTPUT_SLOT,
-            64
+            OUTPUT_LIMIT
         )
-    end)
 
-    if not success then
-        print("Could not collect from:")
-        print(machineName)
-        print(tostring(moved))
-        return 0
+        -- The output barrel is full or otherwise blocked. Do not add more work.
+        if movedOut < outputItem.count then
+            return movedOut, 0
+        end
     end
 
-    return moved
+    -- Keep exactly one total input item in the smelter.
+    if items[INPUT_SLOT_1]
+        or items[INPUT_SLOT_2]
+        or items[INPUT_SLOT_3] then
+
+        return movedOut, 0
+    end
+
+    local movedIn = Controller.pushOneInput(
+        source,
+        machineName,
+        sourceState
+    )
+
+    return movedOut, movedIn
 end
 
---------------------------------------------------
--- STARTUP CHECKS
---------------------------------------------------
+function Controller.runPass(source, outputName, smelters, startingIndex)
+    local sourceState = Controller.newSourceState(source)
+    local machineCount = #smelters
+
+    if machineCount == 0 then
+        return 1
+    end
+
+    for offset = 0, machineCount - 1 do
+        local index = ((startingIndex + offset - 1) % machineCount) + 1
+        local entry = smelters[index]
+
+        Controller.serviceMachine(
+            source,
+            outputName,
+            entry.name,
+            entry.inventory,
+            sourceState
+        )
+    end
+
+    return (startingIndex % machineCount) + 1
+end
+
+local args = { ... }
+
+if args[1] == "__test__" then
+    return Controller
+end
+
+local sourceName, outputName = Controller.detectBarrels(peripheral)
+local source = peripheral.wrap(sourceName)
+local smelters = Controller.findSmelters(
+    peripheral,
+    sourceName,
+    outputName
+)
+
+if not source or type(source.list) ~= "function"
+    or type(source.pushItems) ~= "function" then
+
+    error("The detected gold source barrel is not a usable inventory.")
+end
+
+if #smelters == 0 then
+    error("No Ender IO Alloy Smelters were detected on the wired network.")
+end
 
 term.clear()
 term.setCursorPos(1, 1)
-
-if not peripheral.isPresent(SOURCE_NAME) then
-    error("Input barrel not found: " .. SOURCE_NAME)
-end
-
-if not peripheral.isPresent(OUTPUT_NAME) then
-    print("Output barrel not found:")
-    print(OUTPUT_NAME)
-    print("")
-    print("Connected inventories:")
-
-    for _, name in ipairs(peripheral.getNames()) do
-        if hasType(name, "inventory") then
-            print(name)
-        end
-    end
-
-    error("Correct OUTPUT_NAME near the top of rc.lua")
-end
-
-local source = peripheral.wrap(SOURCE_NAME)
-local outputBarrel = peripheral.wrap(OUTPUT_NAME)
-
-if not source or type(source.pushItems) ~= "function" then
-    error("Input barrel is not a usable inventory.")
-end
-
-if not outputBarrel or type(outputBarrel.pullItems) ~= "function" then
-    error("Output barrel is not a usable inventory.")
-end
-
-local smelters = findAlloySmelters()
-
-if #smelters == 0 then
-    error("No Alloy Smelters were detected.")
-end
-
---------------------------------------------------
--- STATUS DISPLAY
---------------------------------------------------
-
-print("Alloy Smelter Controller")
-print("------------------------")
-print("Input:  " .. SOURCE_NAME)
-print("Output: " .. OUTPUT_NAME)
+print("Fast Alloy Smelter Controller")
+print("-----------------------------")
+print("Source: " .. sourceName)
+print("Output: " .. outputName)
 print("Smelters: " .. #smelters)
 print("")
-print("Running... Hold Ctrl+T to stop.")
+print("Running at maximum polling speed.")
+print("Hold Ctrl+T to stop.")
 
---------------------------------------------------
--- MAIN LOOP
---------------------------------------------------
-
-local startingMachine = 1
+local startingIndex = 1
 
 while true do
-    for offset = 0, #smelters - 1 do
-        local index =
-            ((startingMachine + offset - 1) % #smelters) + 1
+    startingIndex = Controller.runPass(
+        source,
+        outputName,
+        smelters,
+        startingIndex
+    )
 
-        local machineName = smelters[index]
-        local machine = peripheral.wrap(machineName)
-
-        if machine and type(machine.list) == "function" then
-            -- First remove completed output.
-            collectOutput(outputBarrel, machineName, machine)
-
-            -- Then supply one new item when all input slots are empty.
-            if countInputItems(machine) == 0 then
-                sendOneInput(source, machineName)
-            end
-        end
-    end
-
-    -- Rotate the first machine so distribution remains fair.
-    startingMachine = (startingMachine % #smelters) + 1
-
-    sleep(CHECK_INTERVAL)
+    -- Yield exactly once after the complete machine array is serviced.
+    -- In CC:Tweaked this resumes on the next Minecraft tick.
+    sleep(0)
 end
